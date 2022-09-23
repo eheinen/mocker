@@ -11,13 +11,16 @@ import (
 )
 
 const (
-	interfaceNamePattern     = "type (.+) interface"
-	functionNamePattern      = "([\\w]+)\\("
-	functionArgumentsPattern = "\\((.+)\\) "
-	functionReturnPattern    = "\\) (.+)"
+	interfaceNamePattern          = "type (.+) interface"
+	functionNamePattern           = "([\\w]+)\\("
+	functionArgumentsPattern      = "\\((.+)\\) "
+	functionCompoundReturnPattern = "\\) \\((.+)\\)"
+	functionSingleReturnPattern   = "\\) (.+)"
 
 	mocksDirectoryName = "/mocks"
-	mockerPathName     = "/mocker.go"
+	mockerPathName     = "%s/%s_mocker.go"
+
+	mockAnything = "mock.Anything"
 )
 
 var skipFilesInDir = []string{
@@ -30,6 +33,10 @@ var skipFilesWithName = []string{
 	"mocker.go",
 }
 
+var userAnythingForTypes = []string{
+	"context.Context",
+}
+
 type file struct {
 	path string
 	info os.FileInfo
@@ -38,6 +45,16 @@ type file struct {
 type interfaceDetail struct {
 	name      string
 	functions []string
+}
+
+type functionArgument struct {
+	text    string
+	details []argumentDetails
+}
+
+type argumentDetails struct {
+	varName string
+	varType string
 }
 
 func GenerateMockers() {
@@ -97,7 +114,6 @@ func generateMockers(files []file) {
 
 		if len(details) > 0 {
 			currentDirectory := path.Dir(file.path)
-			fmt.Println(currentDirectory)
 
 			currentMockDirectory := currentDirectory + mocksDirectoryName
 			if _, err := os.Stat(currentMockDirectory); os.IsNotExist(err) {
@@ -118,7 +134,8 @@ func generateMockers(files []file) {
 					buildAssertMockFunction(&mockerFileBuilder, function)
 				}
 
-				writeMockerFile(currentMockDirectory+mockerPathName, &mockerFileBuilder)
+				mockerFileName := fmt.Sprintf(mockerPathName, currentMockDirectory, strings.TrimRight(file.info.Name(), ".go"))
+				writeMockerFile(mockerFileName, &mockerFileBuilder)
 			}
 		}
 	}
@@ -140,27 +157,36 @@ func buildMockFunction(fileBuilder *strings.Builder, functionText string) {
 	functionArguments := extractFunctionArguments(functionText)
 	functionReturns := extractFunctionReturns(functionText)
 
+	buildFunctionComment(fileBuilder, "Mock", functionName, functionArguments, functionReturns)
+
 	if len(functionReturns) > 0 {
 		fileBuilder.WriteString(fmt.Sprintf("\nfunc Mock%s(mocking *mock.Mock, expectedReturns ...interface{}) *mock.Call {\n", functionName))
 	} else {
 		fileBuilder.WriteString(fmt.Sprintf("\nfunc Mock%s(mocking *mock.Mock) *mock.Call {\n", functionName))
 	}
 
-	if len(functionArguments) > 0 {
+	if len(functionArguments.text) > 0 {
 		fileBuilder.WriteString(fmt.Sprintf("\treturn mocking.On(\"%s\",\n", functionName))
-		for _, argument := range functionArguments {
-			fileBuilder.WriteString(fmt.Sprintf("\t\tmock.AnythingOfType(\"%s\"),\n", cleanText(argument)))
+		for _, argument := range functionArguments.details {
+			var useType = fmt.Sprintf("\t\tmock.AnythingOfType(\"%s\"),\n", argument.varType)
+			for _, anythingType := range userAnythingForTypes {
+				if anythingType == argument.varType {
+					useType = fmt.Sprintf("\t\t%s,\n", mockAnything)
+				}
+			}
+
+			fileBuilder.WriteString(useType)
 		}
 	} else {
 		fileBuilder.WriteString(fmt.Sprintf("\treturn mocking.On(\"%s\"", functionName))
 	}
 
 	if len(functionReturns) > 0 {
-		if len(functionArguments) > 0 {
+		if len(functionArguments.text) > 0 {
 			fileBuilder.WriteString("\t")
 		}
 
-		fileBuilder.WriteString(").Return(expectedReturns)")
+		fileBuilder.WriteString(").Return(expectedReturns...)")
 	} else {
 		fileBuilder.WriteString(")")
 	}
@@ -170,19 +196,39 @@ func buildMockFunction(fileBuilder *strings.Builder, functionText string) {
 
 func buildAssertMockFunction(fileBuilder *strings.Builder, functionText string) {
 	functionName := extractFunctionName(functionText)
-	functionReturn := extractFunctionReturns(functionText)
+	functionArguments := extractFunctionArguments(functionText)
+	functionReturns := extractFunctionReturns(functionText)
 
-	if len(functionReturn) > 0 {
-		fileBuilder.WriteString(fmt.Sprintf("\nfunc Assert%s(mocking *mock.Mock, times int, expectedReturns ...interface{}) {", functionName))
+	buildFunctionComment(fileBuilder, "Assert", functionName, functionArguments, []string{})
+
+	if len(functionReturns) > 0 {
+		fileBuilder.WriteString(fmt.Sprintf("\nfunc Assert%s(t *testing.T, mocking *mock.Mock, times int, expectedReturns ...interface{}) {", functionName))
 		fileBuilder.WriteString("\n\tif times != 0 {\n")
-		fileBuilder.WriteString(fmt.Sprintf("\t\tmocking.AssertCalled(t, \"%s\", expectedReturns)\n", functionName))
+		fileBuilder.WriteString(fmt.Sprintf("\t\tmocking.AssertCalled(t, \"%s\", expectedReturns...)\n", functionName))
 		fileBuilder.WriteString("\t}\n")
 	} else {
-		fileBuilder.WriteString(fmt.Sprintf("\nfunc Assert%s(mocking *mock.Mock, times int) {", functionName))
+		fileBuilder.WriteString(fmt.Sprintf("\nfunc Assert%s(t *testing.T, mocking *mock.Mock, times int) {", functionName))
 	}
 
 	fileBuilder.WriteString(fmt.Sprintf("\n\tmocking.AssertNumberOfCalls(t, \"%s\", times)\n", functionName))
 	fileBuilder.WriteString("}\n")
+}
+
+func buildFunctionComment(fileBuilder *strings.Builder, namePrefix string, functionName string, functionArguments functionArgument, functionReturns []string) {
+	fileBuilder.WriteString(fmt.Sprintf("\n// %s%s", namePrefix, functionName))
+
+	if len(strings.TrimSpace(functionArguments.text)) != 0 {
+		fileBuilder.WriteString(fmt.Sprintf("\n// (%s)", functionArguments.text))
+	}
+
+	returns := strings.Join(functionReturns, ", ")
+	if len(strings.TrimSpace(returns)) != 0 {
+		fileBuilder.WriteString(fmt.Sprintf("\n// %s", returns))
+	}
+
+	if len(strings.TrimSpace(functionArguments.text)) == 0 && len(strings.TrimSpace(returns)) == 0 {
+		fileBuilder.WriteString("\n// No argument and return expected")
+	}
 }
 
 func extractFunctionName(functionText string) string {
@@ -190,7 +236,10 @@ func extractFunctionName(functionText string) string {
 }
 
 func extractFunctionReturns(functionText string) []string {
-	functionReturnsString := getStringGroupFromRegex(functionReturnPattern, functionText, 1)
+	functionReturnsString := getStringGroupFromRegex(functionCompoundReturnPattern, functionText, 1)
+	if len(strings.TrimSpace(functionReturnsString)) == 0 {
+		functionReturnsString = getStringGroupFromRegex(functionSingleReturnPattern, functionText, 1)
+	}
 	var functionReturns []string
 	if len(cleanText(functionReturnsString)) > 0 {
 		functionReturns = strings.Split(cleanText(functionReturnsString), ",")
@@ -199,14 +248,29 @@ func extractFunctionReturns(functionText string) []string {
 	return functionReturns
 }
 
-func extractFunctionArguments(functionText string) []string {
+func extractFunctionArguments(functionText string) functionArgument {
 	functionArgumentString := getStringGroupFromRegex(functionArgumentsPattern, functionText, 1)
 	var functionArguments []string
 	if len(cleanText(functionArgumentString)) > 0 {
 		functionArguments = strings.Split(cleanText(functionArgumentString), ",")
 	}
 
-	return functionArguments
+	var argDetails []argumentDetails
+	for _, argumentReturn := range functionArguments {
+		argumentsSplit := strings.Split(cleanText(argumentReturn), " ")
+
+		detail := argumentDetails{
+			varName: argumentsSplit[0],
+			varType: argumentsSplit[1],
+		}
+
+		argDetails = append(argDetails, detail)
+	}
+
+	return functionArgument{
+		text:    functionArgumentString,
+		details: argDetails,
+	}
 }
 
 func getStringGroupFromRegex(pattern string, text string, groupIndex int) string {
